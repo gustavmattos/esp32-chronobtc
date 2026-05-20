@@ -4,12 +4,17 @@
 #include <WiFi.h>
 #include <WiFiUdp.h>
 #include <Timezone.h>
-#include <DHT.h>  // Sensor DHT22
+#include <HTTPClient.h>
+#include <ArduinoJson.h>
+#include <DHT.h>
 
-#define DHTPIN 22       // GPIO usado para o pino de dados do DHT22
-#define DHTTYPE DHT22   // Tipo do sensor
+#define DHTPIN 22
+#define DHTTYPE DHT22
 DHT dht(DHTPIN, DHTTYPE);
-float temperature = NAN; // Armazena a última leitura válida
+float temperature = NAN;
+long btcPrice = -1;
+unsigned long lastBtcFetch = 0;
+const unsigned long BTC_FETCH_INTERVAL = 60000;
 
 #define TOUCH_CS
 
@@ -24,9 +29,7 @@ WiFiUDP Udp;
 unsigned int localPort = 8888;
 TimeChangeRule *tcr;
 
-String credentials[][2] = {
-    {"APTO 4", "vivalavida4"},
-};
+#include "secrets.h"
 
 const bool SHOW_24HOUR = false;
 const bool SHOW_AMPM = true;
@@ -211,6 +214,46 @@ time_t getNtpTime() {
   return timeNotSet;
 }
 
+void fetchBitcoinPrice() {
+  if (millis() - lastBtcFetch < BTC_FETCH_INTERVAL) return;
+  lastBtcFetch = millis();
+
+  HTTPClient http;
+  http.begin("https://api.binance.com/api/v3/ticker/price?symbol=BTCUSDT");
+  if (http.GET() == 200) {
+    StaticJsonDocument<128> doc;
+    deserializeJson(doc, http.getString());
+    btcPrice = doc["price"].as<float>();
+  }
+  http.end();
+}
+
+void DrawBitcoinPrice() {
+  tft.setTextDatum(MC_DATUM);
+  tft.setTextSize(2);
+  int h = tft.fontHeight();
+  tft.fillRect(0, 145 - h / 2, 320, h, TFT_BLACK);
+  if (btcPrice > 0) {
+    char buffer[24];
+    sprintf(buffer, "BTC: $%ld", btcPrice);
+    tft.setTextColor(TFT_GREEN, TFT_BLACK);
+    tft.drawString(buffer, 320 / 2, 145);
+    tft.setTextColor(clockFontColor, clockBackgroundColor);
+  }
+}
+
+void DrawTemperature() {
+  tft.setTextDatum(MC_DATUM);
+  tft.setTextSize(2);
+  int h = tft.fontHeight();
+  tft.fillRect(0, 120 - h / 2, 320, h, TFT_BLACK);
+  if (!isnan(temperature)) {
+    char buffer[16];
+    sprintf(buffer, "%.1f C", temperature);
+    tft.drawString(buffer, 320 / 2, 120);
+  }
+}
+
 void DrawDate(time_t utc) {
   time_t local = myTZ.toLocal(utc, &tcr);
   int dd = day(local);
@@ -237,13 +280,6 @@ void DrawDate(time_t utc) {
   }
 }
 
-void DrawMessage(String msg) {
-  tft.setTextDatum(MC_DATUM);
-  tft.setTextSize(2);
-  int h = tft.fontHeight();
-  tft.fillRect(0, 120 - h / 2, 320, h, TFT_BLACK);
-  tft.drawString(msg, 320 / 2, 120);
-}
 
 void SetupWiFi() {
   while (WiFi.status() != WL_CONNECTED) {
@@ -272,7 +308,7 @@ void SetupNTP() {
 
 void setup() {
   Serial.begin(115200);
-  dht.begin();          // Inicializa o DHT22
+  dht.begin();
   SetupCYD();
   SetupWiFi();
   SetupNTP();
@@ -291,16 +327,12 @@ void loop() {
     DrawColons();
     DrawAmPm();
 
-    // Leitura do sensor
     float temp = dht.readTemperature();
-    if (!isnan(temp)) {
-      temperature = temp;
-    }
+    if (!isnan(temp)) temperature = temp;
+    DrawTemperature();
 
-    // Mostrar mensagem com temperatura
-    char buffer[32];
-    sprintf(buffer, "AMO A ANGEL <3 | %.1f°C", temperature);
-    DrawMessage(buffer);
+    fetchBitcoinPrice();
+    DrawBitcoinPrice();
   }
   delay(100);
 }
