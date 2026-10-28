@@ -1,5 +1,7 @@
 # CYD Rolling Clock
 
+> **Novo firmware Atlântico:** relógio, BTC/USD, USD/BRL e previsão de três dias para Florianópolis. Veja [configuração e gravação](ATLANTICO.md) e a [prévia visual](design/atlantico.svg). O código atual fica em `src/main.cpp` e usa PlatformIO. A documentação abaixo descreve a versão histórica Arduino/DHT22.
+
 Relógio digital com temperatura ambiente em tempo real, rodando em ESP32 com display TFT colorido.
 
 ![Foto do projeto](relogioEsp.jpeg)
