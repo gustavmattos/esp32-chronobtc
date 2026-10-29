@@ -1,16 +1,19 @@
 #include <Arduino.h>
 #include <WiFi.h>
 #include <WiFiClientSecure.h>
+#include <ArduinoOTA.h>
 #include <HTTPClient.h>
 #include <ArduinoJson.h>
 #include <TFT_eSPI.h>
 #include <time.h>
+#include <esp_heap_caps.h>
 #include "secrets.h"
 #include "trust_store.h"
 
 TFT_eSPI tft;
 TFT_eSprite pages[2] = {TFT_eSprite(&tft), TFT_eSprite(&tft)};
-constexpr uint16_t BG=0x0864, FG=0xEF7D, MUTED=0x9D96, BLUE=0x65DF, GOLD=0xFE49, LINE=0x21CA;
+constexpr uint16_t BG=0, FG=1, MUTED=2, BLUE=3, GOLD=4, LINE=5, GREEN=6, ORANGE=7;
+const uint16_t PALETTE[] = {TFT_BLACK, TFT_WHITE, 0x8410, TFT_CYAN, TFT_YELLOW, 0x2104, TFT_GREEN, 0xFD20};
 struct Day { float low, high; int code, rain; char date[11]; };
 struct Model {
   float temp=0, usd=0, btc=0; int code=0; bool night=false;
@@ -23,6 +26,8 @@ SemaphoreHandle_t dataLock;
 int active=0;
 uint32_t pageSince=0, lastPaint=0;
 bool transitioning=false, displayReady=false;
+bool otaReady=false;
+volatile bool otaUpdating=false;
 uint32_t transitionSince=0;
 
 bool fetch(const char *url, JsonDocument &doc) {
@@ -31,20 +36,38 @@ bool fetch(const char *url, JsonDocument &doc) {
   client.setHandshakeTimeout(8);
   HTTPClient http;
   http.setConnectTimeout(5000); http.setTimeout(5000);
-  if (!http.begin(client,url)) return false;
+  if (!http.begin(client,url)) { Serial.printf("HTTP begin failed: %s\n",url); return false; }
   int status=http.GET();
   bool ok=false;
-  if(status==200) ok=!deserializeJson(doc,http.getString());
+  if(status==200) {
+    DeserializationError error=deserializeJson(doc,http.getString());
+    ok=!error;
+    if(error) Serial.printf("JSON error: %s (%s)\n",error.c_str(),url);
+  } else {
+    Serial.printf("HTTP status %d: %s (%s)\n",status,http.errorToString(status).c_str(),url);
+  }
   http.end(); return ok;
 }
 
 void network(void *) {
   uint32_t weatherTry=0, marketTry=0;
   bool firstWeather=true, firstMarket=true;
+  wl_status_t lastWifi=WL_IDLE_STATUS;
+  uint32_t lastClockWarning=0;
   for (;;) {
-    if(WiFi.status()!=WL_CONNECTED) { vTaskDelay(pdMS_TO_TICKS(1000)); continue; }
+    if(otaUpdating) { vTaskDelay(pdMS_TO_TICKS(1000)); continue; }
+    wl_status_t wifi=WiFi.status();
+    if(wifi!=lastWifi) {
+      Serial.printf("Wi-Fi status: %d\n",wifi);
+      if(wifi==WL_CONNECTED) Serial.printf("Wi-Fi connected, IP: %s, RSSI: %d dBm\n",WiFi.localIP().toString().c_str(),WiFi.RSSI());
+      lastWifi=wifi;
+    }
+    if(wifi!=WL_CONNECTED) { vTaskDelay(pdMS_TO_TICKS(1000)); continue; }
     // TLS certificate validation requires a valid system clock.
-    if(time(nullptr)<1700000000) { vTaskDelay(pdMS_TO_TICKS(1000)); continue; }
+    if(time(nullptr)<1700000000) {
+      if(millis()-lastClockWarning>=10000) { Serial.println("Waiting for NTP time"); lastClockWarning=millis(); }
+      vTaskDelay(pdMS_TO_TICKS(1000)); continue;
+    }
     uint32_t now=millis();
     if(firstWeather || now-weatherTry>=600000) {
       firstWeather=false; weatherTry=now;
@@ -91,6 +114,11 @@ void network(void *) {
 void label(TFT_eSprite &s, const String &value,int x,int y,int font=2,uint16_t color=FG,int datum=TL_DATUM) {
   s.setTextDatum(datum); s.setTextColor(color,BG); s.drawString(value,x,y,font);
 }
+void pixelLabel(TFT_eSprite &s, const String &value,int x,int y,int size,uint16_t color) {
+  s.setTextSize(size);
+  label(s,value,x,y,1,color,TC_DATUM);
+  s.setTextSize(1);
+}
 void icon(TFT_eSprite &s,int x,int y,int code,bool night=false) {
   if(code<=2) {
     if(night) {s.fillCircle(x+12,y+11,10,FG);s.fillCircle(x+17,y+7,9,BG);}
@@ -132,30 +160,28 @@ void paint(int index) {
   auto &s=pages[index]; s.fillSprite(BG);
   tm local{}; time_t epoch=time(nullptr); bool clockOk=epoch>1700000000;
   localtime_r(&epoch,&local);
-  char hhmm[8]; if(clockOk)strftime(hhmm,sizeof(hhmm),"%H:%M",&local);else strlcpy(hhmm,"--:--",8);
+  char hhmm[9]; if(clockOk)strftime(hhmm,sizeof(hhmm),"%H:%M:%S",&local);else strlcpy(hhmm,"--:--:--",9);
   const char *week[]={"DOM","SEG","TER","QUA","QUI","SEX","SAB"};
   if(index==0) {
     char date[40];snprintf(date,sizeof(date),"%s, %02d.%02d.%04d",week[local.tm_wday],local.tm_mday,local.tm_mon+1,local.tm_year+1900);
-    label(s,clockOk?date:"SINCRONIZANDO HORA",16,17,2,MUTED);
-    label(s,hhmm,160,57,8,FG,TC_DATUM);
-    s.drawFastHLine(16,153,288,LINE);s.drawFastVLine(174,171,43,LINE);
-    label(s,"BITCOIN / USD",16,166,2,BLUE);label(s,m.dailyDollar?"USD/BRL DIA":"DOLAR / BRL",190,166,2,BLUE);
-    label(s,m.bitcoin?money(m.btc,false):"--",16,188,4);
-    label(s,m.dollar?money(m.usd,true):"--",190,188,4);
+    pixelLabel(s,hhmm,160,26,6,GOLD);
+    label(s,clockOk?date:"SINCRONIZANDO HORA",160,99,2,FG,TC_DATUM);
+    pixelLabel(s,m.bitcoin?"BTC: "+money(m.btc,false):"BTC: --",160,145,2,GREEN);
+    pixelLabel(s,m.dollar?(m.dailyDollar?"USD/BRL DIA: ":"USD/BRL: ")+money(m.usd,true):"USD/BRL: --",160,184,2,ORANGE);
   } else {
-    label(s,"FLORIANOPOLIS",16,14,2,FG);label(s,hhmm,304,14,2,MUTED,TR_DATUM);
-    icon(s,16,49,m.weather?m.code:3,m.night);
-    label(s,m.weather?String(lroundf(m.temp))+" C":"-- C",70,43,4,FG);
-    label(s,m.weather?condition(m.code,m.night):"Buscando previsao...",70,74,2,MUTED);
-    s.drawFastHLine(16,104,288,LINE);
+    label(s,"FLORIANOPOLIS",16,12,2,FG);label(s,String(hhmm).substring(0,5),304,12,2,GOLD,TR_DATUM);
+    icon(s,27,47,m.weather?m.code:3,m.night);
+    label(s,m.weather?String(m.temp,1)+" C":"--.- C",96,48,4,BLUE);
+    label(s,m.weather?condition(m.code,m.night):"Buscando previsao...",160,91,2,FG,TC_DATUM);
+    s.drawFastHLine(16,115,288,LINE);
     for(int i=0;i<3;i++) {
       int x=16+i*100;
       String day="--";
       if(m.weather) {tm d{};int yy,mm,dd;if(sscanf(m.days[i].date,"%d-%d-%d",&yy,&mm,&dd)==3) {d.tm_year=yy-1900;d.tm_mon=mm-1;d.tm_mday=dd;d.tm_hour=12;mktime(&d);day=week[d.tm_wday];}}
-      label(s,day,x+44,113,2,MUTED,TC_DATUM);
-      if(m.weather)icon(s,x+24,135,m.days[i].code);
-      label(s,m.weather?String(lroundf(m.days[i].high))+" / "+String(lroundf(m.days[i].low)):"-- / --",x+44,177,4,FG,TC_DATUM);
-      label(s,m.weather?String(m.days[i].rain)+"% chuva":"--% chuva",x+44,206,2,BLUE,TC_DATUM);
+      label(s,day,x+44,121,2,GOLD,TC_DATUM);
+      if(m.weather)icon(s,x+24,141,m.days[i].code);
+      label(s,m.weather?String(lroundf(m.days[i].high))+" / "+String(lroundf(m.days[i].low)):"-- / --",x+44,182,2,FG,TC_DATUM);
+      label(s,m.weather?String(m.days[i].rain)+"% chuva":"--% chuva",x+44,204,2,BLUE,TC_DATUM);
     }
   }
   bool stale=index==0?(!m.bitcoin || !m.dollar || millis()-m.bitcoinAt>600000 || millis()-m.dollarAt>600000):(!m.weather || millis()-m.weatherAt>1800000);
@@ -165,16 +191,33 @@ void paint(int index) {
 
 void setup() {
   Serial.begin(115200);
-  tft.init();tft.setRotation(1);tft.fillScreen(BG);
-  for(auto &s:pages) {s.setColorDepth(8);if(!s.createSprite(320,240)) {tft.setTextColor(TFT_WHITE,BG);tft.drawString("Memoria insuficiente",12,100,2);return;}}
+  tft.init();tft.setRotation(1);tft.fillScreen(PALETTE[BG]);
+  for(auto &s:pages) {s.setColorDepth(4);if(!s.createSprite(320,240)) {tft.setTextColor(TFT_WHITE,PALETTE[BG]);tft.drawString("Memoria insuficiente",12,100,2);return;}s.createPalette(PALETTE,8);}
+  Serial.printf("Free heap: %u, largest block: %u\n",ESP.getFreeHeap(),heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
   dataLock=xSemaphoreCreateMutex();if(!dataLock)return;
   WiFi.mode(WIFI_STA);WiFi.setAutoReconnect(true);WiFi.begin(WIFI_SSID,WIFI_PASSWORD);
   configTzTime("BRT3","pool.ntp.org","time.cloudflare.com");
-  xTaskCreatePinnedToCore(network,"network",12288,nullptr,1,nullptr,0);
+  xTaskCreatePinnedToCore(network,"network",12288,nullptr,1,nullptr,1);
   paint(0);pages[0].pushSprite(0,0);pageSince=millis();displayReady=true;
 }
 void loop() {
   if(!displayReady){delay(1000);return;}
+  if(WiFi.status()==WL_CONNECTED) {
+    if(!otaReady) {
+      ArduinoOTA.setHostname("chronobtc");
+      ArduinoOTA.setPassword(OTA_PASSWORD);
+      ArduinoOTA.onStart([]() { otaUpdating=true; Serial.println("OTA update started"); });
+      ArduinoOTA.onEnd([]() { Serial.println("OTA update complete"); });
+      ArduinoOTA.onError([](ota_error_t error) { otaUpdating=false; Serial.printf("OTA error: %u\n",error); });
+      ArduinoOTA.begin();
+      otaReady=true;
+      Serial.printf("OTA ready at %s:3232\n",WiFi.localIP().toString().c_str());
+    }
+    ArduinoOTA.handle();
+  } else if(otaReady) {
+    ArduinoOTA.end();
+    otaReady=false;
+  }
   uint32_t now=millis();
   if(transitioning) {
     float p=min(1.0f,(now-transitionSince)/350.0f);float eased=p*p*(3-2*p);
@@ -185,7 +228,7 @@ void loop() {
     if(p>=1) {active=next;transitioning=false;pageSince=millis();lastPaint=millis();}
     delay(1);return;
   }
-  if(now-pageSince >= (active==0?10000U:20000U)) {
+  if(now-pageSince >= 10000U) {
     paint(1-active);transitioning=true;transitionSince=now;return;
   }
   if(now-lastPaint>=1000){paint(active);pages[active].pushSprite(0,0);lastPaint=now;}
